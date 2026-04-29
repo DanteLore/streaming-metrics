@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# data directories — exclude everything except the .gitkeep markers
+data/landing/
+data/checkpoints/
+data/flags/
+data/metrics.db
+data/metrics.db-wal
+data/metrics.db-shm
+
+# Spark
+derby.log
+metastore_db/
+
+# IDE
+.idea/
+.vscode/
