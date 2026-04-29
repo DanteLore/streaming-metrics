@@ -3,7 +3,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import sqlite3
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -11,11 +10,13 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
+from shared import pulsar_streams as streams
 from shared.schema import (
     COMPLIANCE_CRITICAL_THRESHOLD,
-    DB_PATH,
     DEVICES,
     FOOD_SAFETY_MIN_TEMP,
+    METRICS_TOPIC,
+    TELEMETRY_TOPIC,
     VIBRATION_ALERT_RATIO,
 )
 
@@ -36,56 +37,117 @@ STAGE_COLOURS = {
     "idle":    "#555577",
 }
 BG = "#0e1117"
-BOX_BG = "rgba(255,255,255,0.05)"
 
 
-# ── data helpers ─────────────────────────────────────────────────────────────
+# ── Stream reader session management ─────────────────────────────────────────
 
-def _query(sql: str, params: tuple = ()) -> pd.DataFrame:
+BUFFER_MAX = 500
+
+
+def _init_readers() -> None:
+    if "readers_ready" in st.session_state:
+        return
     try:
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(sql, conn, params=params)
-        conn.close()
-        return df
+        client = streams.make_client()
+        st.session_state.telemetry_reader = streams.make_reader(client, TELEMETRY_TOPIC)
+        st.session_state.metrics_reader = streams.make_reader(client, METRICS_TOPIC)
+        st.session_state.telemetry_buffer = []
+        st.session_state.metrics_buffer = []
+        st.session_state.readers_ready = True
     except Exception:
-        return pd.DataFrame()
+        st.session_state.readers_ready = False
 
 
-def latest_readings() -> pd.DataFrame:
-    return _query("SELECT * FROM latest_readings")
+def _drain_readers() -> None:
+    if not st.session_state.get("readers_ready"):
+        return
+    try:
+        for reader_key, buffer_key in [
+            ("telemetry_reader", "telemetry_buffer"),
+            ("metrics_reader",   "metrics_buffer"),
+        ]:
+            fresh = streams.drain(st.session_state[reader_key])
+            buf = st.session_state.get(buffer_key, [])
+            st.session_state[buffer_key] = (fresh + buf)[:BUFFER_MAX]
+    except Exception:
+        st.session_state.pop("readers_ready", None)
 
 
-def temp_metrics() -> pd.DataFrame:
-    return _query(
-        "SELECT window_start, window_end, "
-        "CAST(temp_sum AS REAL) / temp_count AS mean_temp, "
-        "temp_count, computed_at "
-        "FROM temp_metrics ORDER BY window_start DESC LIMIT 40"
-    )
+_init_readers()
+_drain_readers()
+
+t_buf = st.session_state.get("telemetry_buffer", [])
+m_buf = st.session_state.get("metrics_buffer", [])
 
 
-def production_hourly() -> pd.DataFrame:
-    return _query(
-        "SELECT hour, total_sausages, computed_at "
-        "FROM production_hourly ORDER BY hour DESC LIMIT 24"
-    )
+# ── Buffer query helpers ──────────────────────────────────────────────────────
+
+def latest_sensor_values(buf: list) -> pd.DataFrame:
+    seen: dict = {}
+    for msg in buf:  # buf is newest-first
+        did = msg.get("device_id")
+        if did and did not in seen:
+            seen[did] = msg
+    return pd.DataFrame(list(seen.values())) if seen else pd.DataFrame()
 
 
-def compliance_violations() -> pd.DataFrame:
-    return _query(
-        "SELECT window_start, window_end, mean_temp, computed_at "
-        "FROM compliance_violations ORDER BY window_start DESC LIMIT 50"
-    )
+def data_lag_seconds(buf: list) -> float | None:
+    if not buf:
+        return None
+    try:
+        ts = datetime.fromisoformat(buf[0]["timestamp"])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(tz=timezone.utc) - ts).total_seconds()
+    except Exception:
+        return None
 
 
-def vibration_metrics() -> pd.DataFrame:
-    return _query(
-        "SELECT window_start, window_end, mean_vibration, computed_at "
-        "FROM vibration_metrics ORDER BY window_start DESC LIMIT 60"
-    )
+def _filter_metric(buf: list, metric_type: str, n: int = 200) -> pd.DataFrame:
+    rows = [m for m in buf if m.get("metric") == metric_type][:n]
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-# ── sensor status ─────────────────────────────────────────────────────────────
+def _dedup(df: pd.DataFrame, key: str) -> pd.DataFrame:
+    """Keep the latest computed result per window (buffer is newest-first)."""
+    return df.drop_duplicates(subset=[key], keep="first") if not df.empty else df
+
+
+def temp_window_metrics(buf: list) -> pd.DataFrame:
+    df = _filter_metric(buf, "temp_window")
+    if not df.empty:
+        df = _dedup(df, "window_start")
+        df["mean_temp"] = df["temp_sum"] / df["temp_count"]
+        df = df.sort_values("window_start")
+    return df
+
+
+def production_hourly(buf: list) -> pd.DataFrame:
+    df = _filter_metric(buf, "production_hourly")
+    if not df.empty:
+        df = _dedup(df, "hour")
+        df = df.sort_values("hour")
+    return df
+
+
+def compliance_violations(buf: list) -> pd.DataFrame:
+    df = _filter_metric(buf, "compliance_window")
+    if not df.empty:
+        df = _dedup(df, "window_start")
+        df = df[df["mean_temp"] < FOOD_SAFETY_MIN_TEMP]
+        df = df.sort_values("window_start", ascending=False)
+    return df
+
+
+def vibration_window_metrics(buf: list) -> pd.DataFrame:
+    df = _filter_metric(buf, "vibration_window")
+    if not df.empty:
+        df = _dedup(df, "window_start")
+        df = df.sort_values("window_start")
+    return df
+
+
+# ── Sensor status ─────────────────────────────────────────────────────────────
 
 def sensor_status(device_id: str, value: float) -> str:
     d = DEVICES[device_id]
@@ -103,7 +165,6 @@ def sensor_status(device_id: str, value: float) -> str:
 def build_scada(readings: pd.DataFrame) -> go.Figure:
     vals = dict(zip(readings["device_id"], readings["value"])) if not readings.empty else {}
 
-    # (label, x_centre, [sensor_ids])
     stages = [
         ("HOPPER",   8,  ["hopper_fill"]),
         ("MIXER",   24,  ["mixer_rpm", "mixer_vibration"]),
@@ -135,14 +196,13 @@ def build_scada(readings: pd.DataFrame) -> go.Figure:
                        else "warning" if "warning" in statuses
                        else "ok" if statuses else "idle")
         colour = STAGE_COLOURS[box_status]
-        fill = f"rgba(0,204,102,0.12)" if box_status == "ok" else \
-               f"rgba(255,170,0,0.12)" if box_status == "warning" else \
-               f"rgba(255,68,68,0.12)" if box_status == "alarm" else \
-               "rgba(80,80,100,0.15)"
+        fill = ("rgba(0,204,102,0.12)" if box_status == "ok" else
+                "rgba(255,170,0,0.12)" if box_status == "warning" else
+                "rgba(255,68,68,0.12)" if box_status == "alarm" else
+                "rgba(80,80,100,0.15)")
 
         fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
                       line=dict(color=colour, width=2), fillcolor=fill)
-
         fig.add_annotation(x=xc, y=y1 + 1.5, text=f"<b>{label}</b>",
                            showarrow=False, font=dict(size=9, color=colour),
                            xanchor="center", yanchor="bottom")
@@ -154,28 +214,21 @@ def build_scada(readings: pd.DataFrame) -> go.Figure:
             val = vals.get(sid)
             unit = DEVICES[sid]["unit"]
             val_str = f"{val:.1f} {unit}" if val is not None else "—"
-            status = sensor_status(sid, val) if val is not None else "idle"
-            c = STAGE_COLOURS[status]
-            fig.add_annotation(
-                x=xc, y=y_pos,
-                text=f"<b>{val_str}</b>",
-                showarrow=False,
-                font=dict(size=10, color=c),
-                xanchor="center", yanchor="middle",
-            )
+            c = STAGE_COLOURS[sensor_status(sid, val) if val is not None else "idle"]
+            fig.add_annotation(x=xc, y=y_pos, text=f"<b>{val_str}</b>",
+                               showarrow=False, font=dict(size=10, color=c),
+                               xanchor="center", yanchor="middle")
 
-        # Arrow to next stage
         if i < len(stages) - 1:
             next_xc = stages[i + 1][1]
-            arrow_x = (x1 + next_xc - BOX_W / 2) / 2
-            fig.add_annotation(x=arrow_x, y=Y_MID, text="▶",
+            fig.add_annotation(x=(x1 + next_xc - BOX_W / 2) / 2, y=Y_MID, text="▶",
                                showarrow=False, font=dict(size=14, color="#444466"),
                                xanchor="center", yanchor="middle")
 
     return fig
 
 
-# ── compliance helpers ────────────────────────────────────────────────────────
+# ── Compliance summary ────────────────────────────────────────────────────────
 
 def compliance_summary(violations: pd.DataFrame) -> tuple[int, str]:
     n = len(violations)
@@ -186,50 +239,42 @@ def compliance_summary(violations: pd.DataFrame) -> tuple[int, str]:
     return n, "CRITICAL"
 
 
-# ── vibration alert ───────────────────────────────────────────────────────────
+# ── Vibration alert ───────────────────────────────────────────────────────────
 
 def vibration_alert(vib_df: pd.DataFrame) -> tuple[str, float | None]:
     if vib_df.empty:
         return "NO DATA", None
-    short = vib_df.iloc[0]["mean_vibration"]
+    short = vib_df.iloc[-1]["mean_vibration"]
     if len(vib_df) >= 10:
-        baseline = vib_df.head(10)["mean_vibration"].mean()
+        baseline = vib_df["mean_vibration"].iloc[-10:].mean()
         if short > baseline * VIBRATION_ALERT_RATIO:
             return "ALERT", short
     return "OK", short
 
 
-# ── layout ────────────────────────────────────────────────────────────────────
+# ── Layout ────────────────────────────────────────────────────────────────────
 
 st.markdown(
     "<h2 style='margin-bottom:0'>🌿 Verdant Veggie Sausage Co. — Production Monitor</h2>",
     unsafe_allow_html=True,
 )
 
-readings = latest_readings()
-violations = compliance_violations()
+violations = compliance_violations(m_buf)
 viol_count, compliance_status = compliance_summary(violations)
-
 status_colour = {"OK": "green", "WARNING": "orange", "CRITICAL": "red"}.get(compliance_status, "grey")
 lag_active = LAG_FLAG.exists()
 
 header_l, header_r = st.columns([3, 1])
 with header_l:
-    st.markdown(
-        f"Compliance: :{status_colour}[**{compliance_status}**] &nbsp;·&nbsp; "
-        f"{viol_count} violation(s) today",
-        unsafe_allow_html=False,
-    )
+    st.markdown(f"Compliance: :{status_colour}[**{compliance_status}**] &nbsp;·&nbsp; {viol_count} violation(s) today")
 with header_r:
-    if not readings.empty:
-        last_rx = pd.to_datetime(readings["received_at"]).max()
-        if last_rx.tzinfo is None:
-            last_rx = last_rx.tz_localize("UTC")
-        lag_secs = (datetime.now(tz=timezone.utc) - last_rx).total_seconds()
-        st.markdown(f"Data lag: **{lag_secs:.1f}s**")
+    lag = data_lag_seconds(t_buf)
+    if lag is not None:
+        st.markdown(f"Data lag: **{lag:.1f}s**")
 
 # SCADA diagram
 st.subheader("Production Line")
+readings = latest_sensor_values(t_buf)
 if not readings.empty:
     st.plotly_chart(build_scada(readings), width='stretch')
 else:
@@ -237,24 +282,17 @@ else:
 
 st.divider()
 
-# Metrics row
+# Metrics cards
 st.subheader("Calculated Metrics")
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
     st.markdown("**Mean Cook Temp** *(2-min sliding window)*")
-    tdf = temp_metrics()
+    tdf = temp_window_metrics(m_buf)
     if not tdf.empty:
-        latest_temp = tdf.iloc[0]["mean_temp"]
-        delta_colour = "normal" if latest_temp >= FOOD_SAFETY_MIN_TEMP else "inverse"
+        latest_temp = tdf.iloc[-1]["mean_temp"]
         st.metric("Latest window", f"{latest_temp:.1f} °C")
-        chart_data = (
-            tdf.set_index("window_start")["mean_temp"]
-            .sort_index()
-            .rename("°C")
-        )
-        st.line_chart(chart_data, height=150)
-        # Show a safety threshold reference line note
+        st.line_chart(tdf.set_index("window_start")["mean_temp"].rename("°C"), height=150)
         if latest_temp < FOOD_SAFETY_MIN_TEMP:
             st.error(f"Below safety minimum ({FOOD_SAFETY_MIN_TEMP} °C)")
     else:
@@ -262,17 +300,10 @@ with m1:
 
 with m2:
     st.markdown("**Hourly Production**")
-    pdf = production_hourly()
+    pdf = production_hourly(m_buf)
     if not pdf.empty:
-        this_hour = pdf.iloc[0]
-        st.metric("This hour", f"{int(this_hour['total_sausages']):,} sausages")
-        chart_data = (
-            pdf.set_index("hour")["total_sausages"]
-            .sort_index()
-            .tail(8)
-            .rename("sausages")
-        )
-        st.bar_chart(chart_data, height=150)
+        st.metric("This hour", f"{int(pdf.iloc[-1]['total_sausages']):,} sausages")
+        st.bar_chart(pdf.set_index("hour")["total_sausages"].tail(8).rename("sausages"), height=150)
     else:
         st.caption("No data yet")
 
@@ -291,7 +322,7 @@ with m3:
 
 with m4:
     st.markdown("**Mixer Vibration Health**")
-    vdf = vibration_metrics()
+    vdf = vibration_window_metrics(m_buf)
     alert_status, current_vib = vibration_alert(vdf)
     if alert_status == "ALERT":
         st.metric("10-min mean", f"{current_vib:.3f} g")
@@ -302,17 +333,46 @@ with m4:
     else:
         st.caption("No data yet")
     if not vdf.empty:
-        chart_data = (
-            vdf.set_index("window_start")["mean_vibration"]
-            .sort_index()
-            .tail(20)
-            .rename("g")
-        )
-        st.line_chart(chart_data, height=150)
+        st.line_chart(vdf.set_index("window_start")["mean_vibration"].tail(20).rename("g"), height=150)
 
 st.divider()
 
-# Eventual consistency demo controls
+# Stream tails
+st.subheader("Stream Tails")
+
+if not st.session_state.get("readers_ready"):
+    st.warning("Pulsar stream readers not connected — is Pulsar running?")
+else:
+    tail_l, tail_r = st.columns(2)
+
+    with tail_l:
+        st.markdown("**Telemetry stream**")
+        if t_buf:
+            tdf = pd.DataFrame(t_buf)
+            device_options = sorted(tdf["device_id"].unique().tolist())
+            selected_devices = st.multiselect("Filter devices", device_options,
+                                              key="telem_filter", placeholder="All devices")
+            display_tdf = tdf[tdf["device_id"].isin(selected_devices)] if selected_devices else tdf
+            st.dataframe(display_tdf[["timestamp", "device_id", "value"]].head(200),
+                         height=400, width="stretch", hide_index=True)
+        else:
+            st.caption("Waiting for messages…")
+
+    with tail_r:
+        st.markdown("**Metrics stream**")
+        if m_buf:
+            mdf = pd.DataFrame(m_buf)
+            metric_options = sorted(mdf["metric"].unique().tolist())
+            selected_metrics = st.multiselect("Filter metrics", metric_options,
+                                              key="metrics_filter", placeholder="All metrics")
+            display_mdf = mdf[mdf["metric"].isin(selected_metrics)] if selected_metrics else mdf
+            st.dataframe(display_mdf.head(200), height=400, width="stretch", hide_index=True)
+        else:
+            st.caption("Waiting for messages…")
+
+st.divider()
+
+# Eventual consistency demo
 st.subheader("Eventual Consistency Demo")
 ctrl_l, ctrl_r = st.columns([2, 2])
 
@@ -347,7 +407,7 @@ with ctrl_r:
         "Spark's watermark allows events up to **2 minutes late** to be included in "
         "their original windows. When a late event arrives:\n"
         "1. Spark re-evaluates the affected window\n"
-        "2. The updated result replaces the previous value in SQLite\n"
-        "3. The UI picks up the correction on the next refresh\n\n"
+        "2. An updated metric message is published to the Pulsar metrics topic\n"
+        "3. The UI reader picks up the correction on the next refresh\n\n"
         "No manual intervention — the system self-heals."
     )

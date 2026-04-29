@@ -16,12 +16,44 @@ This project demonstrates, using simple code and minimal local tooling, a system
 
 | Concern | Choice | Notes |
 |---|---|---|
-| Streaming backbone | Apache Pulsar | Hard constraint. Run via Docker Compose, vanilla install. |
-| Stream processing | PySpark Structured Streaming | Latest stable PySpark (3.5.x). Micro-batch model. |
+| Streaming backbone | Apache Pulsar 3.3 | Hard constraint. Run via Docker Compose, vanilla install. |
+| Stream processing | PySpark Structured Streaming 3.3.x | Micro-batch model. Pinned to 3.3.x for compatibility with the Pulsar-Spark connector. |
+| Pulsar-Spark connector | StreamNative `pulsar-spark-connector_2.12:3.3.0.1` | Allows Spark to read directly from a Pulsar topic as a streaming source. Downloaded automatically via `spark.jars.packages` on first run. |
 | Telemetry simulator | Python script | Publishes to Pulsar. Simulates realistic + deliberately late/OOO events. |
-| UI | Streamlit | All-Python. Auto-refreshes to show live updates. |
+| UI | Streamlit | All-Python. Auto-refreshes to show live updates. Reads directly from Pulsar using the Reader API. |
 
 No paid tools or services.
+
+---
+
+## Architecture
+
+All data flows through Pulsar. There is no file-based intermediate layer.
+
+```
+[simulator/simulate.py]
+        │
+        │  publishes telemetry events (~1Hz)
+        ▼
+[Pulsar: telemetry topic]
+        │                         │
+        │ readStream               │ Reader API (non-destructive)
+        ▼ (Pulsar-Spark connector) │
+[metrics/jobs.py]                  │
+  PySpark Structured Streaming      │
+        │                          │
+        │ foreachBatch             │
+        ▼                          │
+[Pulsar: metrics topic]            │
+        │                          │
+        │ Reader API               │
+        ▼                          ▼
+              [ui/app.py]
+              Streamlit dashboard
+              (reads both topics directly)
+```
+
+Spark reads the telemetry topic as a native streaming source, computes windowed metrics, and publishes results back to the metrics topic. The UI reads from both topics using Pulsar Readers — non-destructive reads that don't require a subscription or affect message delivery. There is no bridge process, no file landing zone, and no intermediate database.
 
 ---
 
@@ -70,14 +102,11 @@ Metrics are calculated by Spark Structured Streaming and published back to a sep
 
 Mean cook temperature (both zones) over a **2-minute sliding window, updated every 30 seconds**. Stored as SUM + COUNT so windows can be merged correctly when late data arrives.
 
-Also: mean belt speed and mean hopper fill level over the same window.
-
 ### 2. Production counters
 
 * **Sausages per hour** — running total from `sausage_count` events, reset on the hour.
-* **Machine uptime today** — derived from `belt_speed > 0`, accumulated as seconds.
 
-These are good subjects for the eventual consistency demo because a batch of late `sausage_count` events causes the counter to visibly jump and self-correct.
+This is a good subject for the eventual consistency demo because a batch of late `sausage_count` events causes the counter to visibly jump and self-correct.
 
 ### 3. Complex compliance metric — Cook Temperature Safety
 
@@ -91,7 +120,7 @@ This demonstrates that Spark can evaluate stateful, threshold-based rules over t
 
 ### 4. Equipment health metric — Mixer vibration trend
 
-The mean mixer vibration over a **10-minute sliding window** compared against the 1-hour baseline. If the short-window mean exceeds 1.5× the hourly baseline, raise a `MIXER_ALERT`. This shows a relative/derived metric rather than an absolute threshold.
+The mean mixer vibration over a **10-minute sliding window** compared against the rolling baseline. If the short-window mean exceeds 1.5× the baseline, raise a `MIXER_ALERT`. This shows a relative/derived metric rather than an absolute threshold.
 
 ---
 
@@ -101,31 +130,35 @@ This is a key aim. The simulator will deliberately produce two classes of anomal
 
 ### Scenario A — Late batch (production counter)
 
-The `sausage_count` sensor at the packager occasionally buffers readings locally (simulating a flaky network) and then flushes a batch 60–90 seconds late. The UI will show the hourly counter sitting lower than reality, then visibly jumping upward when the late batch lands and Spark reprocesses the affected window. A visual indicator ("last updated", "data lag") reinforces what's happening.
+The `sausage_count` sensor at the packager occasionally buffers readings locally (simulating a flaky network) and then flushes a batch 60–90 seconds late. The UI will show the hourly counter sitting lower than reality, then visibly jumping upward when the late batch lands and Spark reprocesses the affected window.
 
 ### Scenario B — Out-of-order temperature events
 
-The `cook_temp_1` sensor occasionally sends readings with timestamps that are 30–45 seconds behind wall-clock time (simulating a slow edge device). This causes the sliding-window temperature average to be initially calculated on incomplete data, then silently corrected when the delayed readings arrive within Spark's configured watermark window. The UI shows the metric value update without any user action — demonstrating that the system handles late data automatically.
+The `cook_temp_1` sensor occasionally sends readings with timestamps that are 30–45 seconds behind wall-clock time (simulating a slow edge device). This causes the sliding-window temperature average to be initially calculated on incomplete data, then silently corrected when the delayed readings arrive within Spark's configured watermark window (2 minutes). The UI shows the metric value update without any user action.
 
-Both scenarios should be easy to trigger manually in the demo (e.g. a Streamlit button "simulate sensor lag").
+Both scenarios are triggered by a button in the Streamlit UI which creates a flag file (`data/flags/simulate_lag`). The simulator polls for the flag and adjusts its behaviour accordingly.
 
 ---
 
 ## User Interface
 
-Built in Streamlit. Two main views:
+Built in Streamlit, auto-refreshing every 2 seconds. Reads both Pulsar topics directly using the Pulsar Reader API, maintaining a rolling in-memory buffer in `st.session_state`.
 
-### SCADA View (primary)
+### SCADA View
 
-A schematic diagram of the production line showing the six stages in sequence. At each stage, live sensor values update in place (last reading + timestamp). The diagram does not need to be a polished graphic — a clean SVG or HTML/CSS layout with labelled boxes and arrows is sufficient.
+A schematic diagram of the production line showing the six stages in sequence. Live sensor values update in place. Colour coding: green = normal range, amber = approaching limit, red = out of range.
 
-Colour coding on sensor values: green = normal range, amber = approaching limit, red = out of range.
+### Metrics Dashboard
 
-### Metrics Dashboard (secondary, or sidebar)
+Card layout showing all four calculated metrics with charts. Highlights food-safety violations and vibration alerts.
 
-Tabular/card layout showing all calculated metrics with their current values and the time of last update. Highlights when a metric value changes due to a late-data correction (brief flash or delta indicator).
+### Stream Tails
 
-A "data lag" indicator shows the current watermark — i.e. how far behind real time the stream processing is. This makes the eventual consistency behaviour visible.
+Live tail of both the telemetry and metrics topics, filterable by device/metric type. Shows the raw stream order, including the eventual-consistency corrections arriving as updated metric messages.
+
+### Eventual Consistency Demo Panel
+
+Toggle button to activate/deactivate sensor lag simulation, with an explanation of how Spark's watermark model handles the corrections automatically.
 
 ---
 
@@ -133,16 +166,19 @@ A "data lag" indicator shows the current watermark — i.e. how far behind real 
 
 ```
 streaming-metrics/
-├── docker-compose.yml        # Pulsar (and ZooKeeper/BookKeeper)
+├── docker-compose.yml        # Pulsar standalone
+├── requirements.txt
 ├── simulator/
-│   └── simulate.py           # Telemetry generator + Pulsar publisher
+│   └── simulate.py           # Telemetry generator and Pulsar publisher
 ├── metrics/
 │   └── jobs.py               # PySpark Structured Streaming jobs
 ├── ui/
 │   └── app.py                # Streamlit dashboard
 ├── shared/
-│   └── schema.py             # Shared telemetry schema / constants
-└── BRIEF.md
+│   ├── schema.py             # Shared constants (topics, device definitions, thresholds)
+│   └── pulsar_streams.py     # Pulsar client wrapper (make_client, make_reader, drain, etc.)
+└── docs/
+    └── spark-vs-flink.md     # Spark vs Flink trade-off comparison
 ```
 
 ---
@@ -151,5 +187,5 @@ streaming-metrics/
 
 * High-throughput or performance testing — the demo is illustrative, not a load test.
 * Authentication, TLS, or multi-tenant Pulsar configuration.
-* Persistent storage beyond what Spark checkpointing requires.
+* Persistent storage — all state lives in Pulsar topics and Spark checkpoints.
 * Deployment outside a local development machine.

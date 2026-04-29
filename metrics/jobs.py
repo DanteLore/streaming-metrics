@@ -1,11 +1,8 @@
 """PySpark Structured Streaming jobs.
 
-Reads NDJSON files from the landing zone (written by the bridge from the Pulsar
-telemetry topic), calculates four metrics with proper watermarking, then publishes
-each result back to the Pulsar metrics topic via foreachBatch.
-
-A separate metrics consumer reads from the metrics topic and writes to SQLite for
-the UI. Pulsar is the sole integration point for both input and output.
+Reads telemetry directly from the Pulsar telemetry topic via the StreamNative
+Pulsar-Spark connector, calculates four metrics with proper watermarking, then
+publishes each result back to the Pulsar metrics topic via foreachBatch.
 
 The watermark is set to 2 minutes so that late-arriving events (up to ~90 seconds
 late in the lag-simulation scenario) are still included in their correct windows.
@@ -16,16 +13,17 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pulsar
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import avg, col, count, sum, to_timestamp, window
+from pyspark.sql.functions import avg, col, count, from_json, sum, to_timestamp, window
 from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
+from shared import pulsar_streams as streams
 from shared.schema import (
     CHECKPOINT_DIR,
-    LANDING_DIR,
     METRICS_TOPIC,
+    PULSAR_ADMIN_URL,
     PULSAR_URL,
+    TELEMETRY_TOPIC,
 )
 
 TELEMETRY_SCHEMA = StructType([
@@ -37,6 +35,8 @@ TELEMETRY_SCHEMA = StructType([
 WATERMARK = "2 minutes"
 TRIGGER = "10 seconds"
 
+PULSAR_SPARK_CONNECTOR = "io.streamnative.connectors:pulsar-spark-connector_2.12:3.3.0.1"
+
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -45,12 +45,15 @@ def _now() -> str:
 def _publish(records: list[dict]) -> None:
     if not records:
         return
-    client = pulsar.Client(PULSAR_URL, logger=pulsar.ConsoleLogger(pulsar.LoggerLevel.Error))
-    producer = client.create_producer(METRICS_TOPIC, send_timeout_millis=0)
-    for r in records:
-        producer.send(json.dumps(r).encode())
-    producer.close()
-    client.close()
+    try:
+        client = streams.make_client()
+        producer = streams.make_producer(client, METRICS_TOPIC)
+        streams.publish_batch(producer, records)
+        producer.close()
+        client.close()
+    except Exception as e:
+        print(f"ERROR publishing to metrics topic: {e}")
+        raise
 
 
 # --- foreachBatch publishers ---
@@ -110,24 +113,29 @@ def publish_vibration(batch_df, _batch_id):
 # --- Main ---
 
 def run() -> None:
-    Path(LANDING_DIR).mkdir(parents=True, exist_ok=True)
     Path(CHECKPOINT_DIR).mkdir(parents=True, exist_ok=True)
 
     spark = (
         SparkSession.builder
         .appName("StreamingMetrics")
         .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.jars.packages", PULSAR_SPARK_CONNECTOR)
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    raw = (
+    raw_bytes = (
         spark.readStream
-        .format("json")
-        .schema(TELEMETRY_SCHEMA)
-        .option("maxFilesPerTrigger", "20")
-        .load(LANDING_DIR)
+        .format("pulsar")
+        .option("service.url", PULSAR_URL)
+        .option("admin.url", PULSAR_ADMIN_URL)
+        .option("topic", TELEMETRY_TOPIC)
+        .load()
     )
+
+    raw = raw_bytes.select(
+        from_json(col("value").cast("string"), TELEMETRY_SCHEMA).alias("data")
+    ).select("data.*")
 
     telemetry = (
         raw

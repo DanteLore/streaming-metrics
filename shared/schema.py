@@ -1,10 +1,9 @@
 PULSAR_URL = "pulsar://localhost:6650"
+PULSAR_ADMIN_URL = "http://localhost:8080"
 TELEMETRY_TOPIC = "persistent://public/default/telemetry"
 METRICS_TOPIC = "persistent://public/default/metrics"
 
-LANDING_DIR = "data/landing"
 CHECKPOINT_DIR = "data/checkpoints"
-DB_PATH = "data/metrics.db"
 
 # Each device has a stage, display unit, and normal operating range.
 # Values outside the range will be flagged in the UI.
