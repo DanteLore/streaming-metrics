@@ -4,13 +4,8 @@ __pycache__/
 *.pyo
 .DS_Store
 
-# data directories — exclude everything except the .gitkeep markers
-data/landing/
-data/checkpoints/
-data/flags/
-data/metrics.db
-data/metrics.db-wal
-data/metrics.db-shm
+# runtime data — all generated at runtime, nothing to commit
+data/
 
 # Spark
 derby.log
