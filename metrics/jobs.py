@@ -35,7 +35,7 @@ TELEMETRY_SCHEMA = StructType([
 WATERMARK = "2 minutes"
 TRIGGER = "10 seconds"
 
-PULSAR_SPARK_CONNECTOR = "io.streamnative.connectors:pulsar-spark-connector_2.12:3.3.0.1"
+PULSAR_SPARK_CONNECTOR = "io.streamnative.connectors:pulsar-spark-connector_2.12:3.4.0.4"
 
 
 def _now() -> str:

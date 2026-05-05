@@ -14,7 +14,7 @@ services:
       - pulsar_data:/pulsar/data
       - pulsar_logs:/pulsar/logs
     environment:
-      PULSAR_MEM: "-Xms256m -Xmx512m -XX:MaxDirectMemorySize=512m"
+      PULSAR_MEM: "-Xms512m -Xmx1g -XX:MaxDirectMemorySize=1g"
 
 volumes:
   pulsar_data:

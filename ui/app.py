@@ -292,7 +292,9 @@ with m1:
     if not tdf.empty:
         latest_temp = tdf.iloc[-1]["mean_temp"]
         st.metric("Latest window", f"{latest_temp:.1f} °C")
-        st.line_chart(tdf.set_index("window_start")["mean_temp"].rename("°C"), height=150)
+        chart = tdf.copy()
+        chart.index = pd.to_datetime(chart["window_start"]).dt.strftime("%H:%M:%S")
+        st.line_chart(chart["mean_temp"].rename("°C"), height=220)
         if latest_temp < FOOD_SAFETY_MIN_TEMP:
             st.error(f"Below safety minimum ({FOOD_SAFETY_MIN_TEMP} °C)")
     else:
@@ -303,7 +305,9 @@ with m2:
     pdf = production_hourly(m_buf)
     if not pdf.empty:
         st.metric("This hour", f"{int(pdf.iloc[-1]['total_sausages']):,} sausages")
-        st.bar_chart(pdf.set_index("hour")["total_sausages"].tail(8).rename("sausages"), height=150)
+        chart = pdf.tail(8).copy()
+        chart.index = pd.to_datetime(chart["hour"]).dt.strftime("%H:%M:%S")
+        st.bar_chart(chart["total_sausages"].rename("sausages"), height=220)
     else:
         st.caption("No data yet")
 
@@ -333,7 +337,9 @@ with m4:
     else:
         st.caption("No data yet")
     if not vdf.empty:
-        st.line_chart(vdf.set_index("window_start")["mean_vibration"].tail(20).rename("g"), height=150)
+        chart = vdf.tail(20).copy()
+        chart.index = pd.to_datetime(chart["window_start"]).dt.strftime("%H:%M:%S")
+        st.line_chart(chart["mean_vibration"].rename("g"), height=220)
 
 st.divider()
 
