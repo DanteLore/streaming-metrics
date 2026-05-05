@@ -37,7 +37,7 @@ Ten sensors publish telemetry at ~1Hz. Spark computes four metrics from the stre
 
 ## Architecture
 
-All data flows through Pulsar — there is no file bridge, no SQLite, no intermediate store.
+All data flows through Pulsar.
 
 ```
 [simulator/simulate.py]
