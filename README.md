@@ -135,10 +135,11 @@ No paid tools or services. Runs entirely on a local machine.
 **Prerequisites:** Docker Desktop, Python 3.11+, Java 17, tmux.
 
 ```bash
-# Install Java (if needed)
-brew install openjdk@17
+brew install tmux openjdk@17
+```
 
-# Add to ~/.zshrc
+```bash
+# Add Java to ~/.zshrc
 export JAVA_HOME="/opt/homebrew/opt/openjdk@17"
 export PATH="$JAVA_HOME/bin:$PATH"
 
@@ -174,3 +175,68 @@ Press **Stop sensor lag** to return to normal operation.
 - A load or performance test
 - Production-ready code (no auth, no TLS, no error recovery, single-node everything)
 - A Flink comparison (see [docs/spark-vs-flink.md](docs/spark-vs-flink.md) for trade-offs)
+
+---
+
+## Questions for a production build
+
+The following are open questions a team would need to answer before building this at scale (~7 billion rows per day, multi-tenant, cloud-deployed). These are starting points for investigation, not complete answers.
+
+---
+
+### Throughput and partitioning
+
+**Can Pulsar handle 7B rows/day (~80k msg/sec)?**
+Almost certainly yes at the Pulsar layer — Pulsar is designed for high throughput and horizontal scaling. The constraint is likely the broker and BookKeeper tier sizing, not the protocol. Worth investigating: topic partitioning (each partition can be consumed independently), tiered storage offloading to S3/GCS for older segments, and whether the message schema (JSON here) should be replaced with a binary format (Avro, Protobuf) to reduce payload size and serialisation overhead.
+
+**How do we partition the telemetry topic?**
+A single partition is a single sequential log — fine for a demo, a bottleneck at scale. Partitioning by device ID or site ID would allow Spark and downstream consumers to parallelise. Investigate how partition count interacts with Spark's task parallelism and whether device-keyed partitioning causes hot partitions for high-frequency sensors.
+
+---
+
+### Spark at scale
+
+**Where does Spark run in AWS?**
+Three main options to investigate:
+- **Amazon EMR** — managed Spark, straightforward, good integration with S3 for checkpoints. Easiest path.
+- **EMR Serverless** — no cluster to manage, scales to zero, pay-per-use. Worth evaluating for bursty or intermittent workloads.
+- **Kubernetes (EKS) with Spark Operator** — most control, best for teams already running EKS. Higher operational overhead.
+
+**How do we size the Spark cluster?**
+This demo runs on a single local JVM. At 80k msg/sec, shuffle partitions, executor memory, and parallelism all need tuning. Investigate: how many executors are needed for the watermark state store at peak throughput, whether RocksDB state backend is needed over the default in-memory store, and how checkpoint frequency affects latency vs recovery time.
+
+**How do we handle Spark job failure and recovery?**
+Structured Streaming with checkpoints provides exactly-once processing guarantees — on restart it resumes from the last committed offset. Investigate: checkpoint storage on S3 (latency implications), whether `foreachBatch` idempotency is guaranteed if a batch partially completes, and how to handle schema evolution in the checkpoint state.
+
+---
+
+### Metric complexity and state
+
+**What happens when metric definitions change?**
+Changing a window size or adding a new aggregation on a running stream requires either a clean restart (dropping checkpoint state) or a careful migration. Investigate: blue/green Spark job deployments, state schema migration strategies, and whether separating stateless and stateful jobs makes versioning easier.
+
+**How do we support many different metric definitions without redeploying Spark?**
+Currently metric logic is hardcoded in `jobs.py`. At scale, different teams may want different metrics over the same stream. Investigate: a metric configuration store (database-driven window definitions), dynamic Spark job generation, or a rules engine sitting between the raw stream and the metrics topic.
+
+---
+
+### Data quality and late data
+
+**What is the right watermark for production data?**
+The 2-minute watermark here is illustrative. In production, the acceptable lateness depends on the source (edge device, cloud sensor, batch export) and the metric's business use (real-time alerting vs daily reporting). Investigate: per-source watermark policies, whether some metrics need separate streams with different watermarks, and how to monitor actual event lag vs the configured watermark.
+
+**How do we detect and handle corrupt or missing telemetry?**
+The simulator always produces clean data. In production, sensors drop out, send nulls, or repeat stale values. Investigate: dead-sensor detection (no events for N seconds), outlier filtering before windowing, and how Spark handles null values in aggregations.
+
+---
+
+### Infrastructure and operations
+
+**How does Pulsar scale horizontally in AWS?**
+Pulsar separates compute (brokers) from storage (BookKeeper). Brokers are stateless and can be scaled independently. Investigate: running Pulsar on EKS vs using a managed service (StreamNative Cloud, Datastax Astra Streaming), cross-AZ BookKeeper quorum sizing, and whether Pulsar Functions are worth using for lightweight per-message transforms.
+
+**How do we monitor the pipeline health?**
+This demo has no observability beyond Streamlit's data lag indicator. Investigate: Pulsar's built-in metrics (Prometheus endpoint), Spark Structured Streaming metrics (query progress, input rate, processing rate), and alerting on watermark lag as a proxy for pipeline health.
+
+**How do we manage schema evolution?**
+JSON with no schema registry works for a demo but becomes a liability when producers and consumers evolve independently. Investigate: Apache Avro with Pulsar's built-in schema registry, schema compatibility modes (backward, forward), and how the Spark connector handles schema changes in flight.
