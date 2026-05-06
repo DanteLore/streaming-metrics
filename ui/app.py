@@ -160,6 +160,81 @@ def sensor_status(device_id: str, value: float) -> str:
     return "ok"
 
 
+# ── Metric + raw overlay charts ───────────────────────────────────────────────
+
+def _base_fig(height: int) -> go.Figure:
+    fig = go.Figure()
+    fig.update_layout(
+        height=height,
+        margin=dict(l=0, r=0, t=10, b=0),
+        plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=1.12, x=0, font=dict(size=10)),
+        xaxis=dict(tickangle=-45, tickfont=dict(size=9), tickformat="%H:%M:%S"),
+        yaxis=dict(gridcolor="#eeeeee"),
+    )
+    return fig
+
+
+def build_cook_temp_chart(tdf: pd.DataFrame, t_buf: list) -> go.Figure:
+    fig = _base_fig(220)
+
+    raw = pd.DataFrame([m for m in t_buf if m.get("device_id") in ("cook_temp_1", "cook_temp_2")])
+    if not raw.empty:
+        raw["ts"] = pd.to_datetime(raw["timestamp"], utc=True)
+        fig.add_trace(go.Scatter(
+            x=raw["ts"], y=raw["value"],
+            mode="markers", name="raw readings",
+            marker=dict(color="#ff4444", size=4, opacity=0.6),
+        ))
+        t_min = raw["ts"].min()
+    else:
+        t_min = None
+
+    chart = tdf.copy()
+    chart["ts"] = pd.to_datetime(chart["window_start"], utc=True)
+    if t_min is not None:
+        chart = chart[chart["ts"] >= t_min]
+
+    fig.add_trace(go.Scatter(
+        x=chart["ts"], y=chart["mean_temp"],
+        mode="lines+markers", name="2-min mean",
+        line=dict(color="#1f77b4", width=2),
+        marker=dict(size=5),
+    ))
+
+    return fig
+
+
+def build_vibration_chart(vdf: pd.DataFrame, t_buf: list) -> go.Figure:
+    fig = _base_fig(220)
+
+    raw = pd.DataFrame([m for m in t_buf if m.get("device_id") == "mixer_vibration"])
+    if not raw.empty:
+        raw["ts"] = pd.to_datetime(raw["timestamp"], utc=True)
+        fig.add_trace(go.Scatter(
+            x=raw["ts"], y=raw["value"],
+            mode="markers", name="raw readings",
+            marker=dict(color="#ff4444", size=4, opacity=0.6),
+        ))
+        t_min = raw["ts"].min()
+    else:
+        t_min = None
+
+    chart = vdf.tail(20).copy()
+    chart["ts"] = pd.to_datetime(chart["window_start"], utc=True)
+    if t_min is not None:
+        chart = chart[chart["ts"] >= t_min]
+
+    fig.add_trace(go.Scatter(
+        x=chart["ts"], y=chart["mean_vibration"],
+        mode="lines+markers", name="10-min mean",
+        line=dict(color="#1f77b4", width=2),
+        marker=dict(size=5),
+    ))
+
+    return fig
+
+
 # ── SCADA diagram ─────────────────────────────────────────────────────────────
 
 def build_scada(readings: pd.DataFrame) -> go.Figure:
@@ -292,9 +367,7 @@ with m1:
     if not tdf.empty:
         latest_temp = tdf.iloc[-1]["mean_temp"]
         st.metric("Latest window", f"{latest_temp:.1f} °C")
-        chart = tdf.copy()
-        chart.index = pd.to_datetime(chart["window_start"]).dt.strftime("%H:%M:%S")
-        st.line_chart(chart["mean_temp"].rename("°C"), height=220)
+        st.plotly_chart(build_cook_temp_chart(tdf, t_buf), width="stretch")
         if latest_temp < FOOD_SAFETY_MIN_TEMP:
             st.error(f"Below safety minimum ({FOOD_SAFETY_MIN_TEMP} °C)")
     else:
@@ -337,9 +410,7 @@ with m4:
     else:
         st.caption("No data yet")
     if not vdf.empty:
-        chart = vdf.tail(20).copy()
-        chart.index = pd.to_datetime(chart["window_start"]).dt.strftime("%H:%M:%S")
-        st.line_chart(chart["mean_vibration"].rename("g"), height=220)
+        st.plotly_chart(build_vibration_chart(vdf, t_buf), width="stretch")
 
 st.divider()
 

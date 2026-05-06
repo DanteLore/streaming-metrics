@@ -4,7 +4,7 @@ set -euo pipefail
 SESSION="streaming-metrics"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV="$DIR/.venv/bin/activate"
-ACTIVATE="source '$VENV'"
+ACTIVATE="source '$VENV' && export TZ=UTC"
 
 # Pulsar health check — polls the admin API
 WAIT_PULSAR="echo 'Waiting for Pulsar...' && until curl -sf http://localhost:8080/admin/v2/clusters > /dev/null 2>&1; do sleep 2; done && echo 'Pulsar ready.'"
