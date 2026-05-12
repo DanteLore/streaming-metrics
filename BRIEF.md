@@ -100,7 +100,7 @@ Metrics are calculated by Spark Structured Streaming and published back to a sep
 
 ### 1. Simple sliding-window averages
 
-Mean cook temperature (both zones) over a **2-minute sliding window, updated every 30 seconds**. Stored as SUM + COUNT so windows can be merged correctly when late data arrives.
+Mean cook temperature (both zones) over a **1-minute sliding window, updated every 30 seconds**. Stored as SUM + COUNT so windows can be merged correctly when late data arrives.
 
 ### 2. Production counters
 
@@ -112,7 +112,7 @@ This is a good subject for the eventual consistency demo because a batch of late
 
 Vegetarian sausages must reach a minimum core temperature. The rule: **cook temperature must not fall below 72°C**. The compliance metric tracks:
 
-* Number of **violation windows** today: a violation window is any 2-minute tumbling window in which the mean cook temperature (average of `cook_temp_1` and `cook_temp_2`) is below 72°C.
+* Number of **violation windows** today: a violation window is any 1-minute tumbling window in which the mean cook temperature (average of `cook_temp_1` and `cook_temp_2`) is below 72°C.
 * A **compliance status** field: `OK` / `WARNING` (1 violation) / `CRITICAL` (2+ violations).
 * A daily violation log with timestamps.
 
@@ -120,7 +120,7 @@ This demonstrates that Spark can evaluate stateful, threshold-based rules over t
 
 ### 4. Equipment health metric — Mixer vibration trend
 
-The mean mixer vibration over a **10-minute sliding window** compared against the rolling baseline. If the short-window mean exceeds 1.5× the baseline, raise a `MIXER_ALERT`. This shows a relative/derived metric rather than an absolute threshold.
+The mean mixer vibration over a **2-minute sliding window** compared against the rolling baseline. If the short-window mean exceeds 1.5× the baseline, raise a `MIXER_ALERT`. This shows a relative/derived metric rather than an absolute threshold.
 
 ---
 

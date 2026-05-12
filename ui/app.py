@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -41,7 +41,7 @@ BG = "#0e1117"
 
 # ── Stream reader session management ─────────────────────────────────────────
 
-BUFFER_MAX = 500
+BUFFER_MAX = 3000
 
 
 def _init_readers() -> None:
@@ -177,6 +177,8 @@ def _base_fig(height: int) -> go.Figure:
 
 def build_cook_temp_chart(tdf: pd.DataFrame, t_buf: list) -> go.Figure:
     fig = _base_fig(220)
+    now = datetime.now(tz=timezone.utc)
+    window = timedelta(minutes=5)
 
     raw = pd.DataFrame([m for m in t_buf if m.get("device_id") in ("cook_temp_1", "cook_temp_2")])
     if not raw.empty:
@@ -186,27 +188,24 @@ def build_cook_temp_chart(tdf: pd.DataFrame, t_buf: list) -> go.Figure:
             mode="markers", name="raw readings",
             marker=dict(color="#ff4444", size=4, opacity=0.6),
         ))
-        t_min = raw["ts"].min()
-    else:
-        t_min = None
 
     chart = tdf.copy()
-    chart["ts"] = pd.to_datetime(chart["window_start"], utc=True)
-    if t_min is not None:
-        chart = chart[chart["ts"] >= t_min]
-
+    chart["ts"] = pd.to_datetime(chart["window_end"], utc=True)
     fig.add_trace(go.Scatter(
         x=chart["ts"], y=chart["mean_temp"],
-        mode="lines+markers", name="2-min mean",
+        mode="lines+markers", name="1-min mean",
         line=dict(color="#1f77b4", width=2),
         marker=dict(size=5),
     ))
 
+    fig.update_layout(xaxis=dict(range=[now - window, now + timedelta(minutes=1)]))
     return fig
 
 
 def build_vibration_chart(vdf: pd.DataFrame, t_buf: list) -> go.Figure:
     fig = _base_fig(220)
+    now = datetime.now(tz=timezone.utc)
+    window = timedelta(minutes=5)
 
     raw = pd.DataFrame([m for m in t_buf if m.get("device_id") == "mixer_vibration"])
     if not raw.empty:
@@ -216,22 +215,17 @@ def build_vibration_chart(vdf: pd.DataFrame, t_buf: list) -> go.Figure:
             mode="markers", name="raw readings",
             marker=dict(color="#ff4444", size=4, opacity=0.6),
         ))
-        t_min = raw["ts"].min()
-    else:
-        t_min = None
 
     chart = vdf.tail(20).copy()
-    chart["ts"] = pd.to_datetime(chart["window_start"], utc=True)
-    if t_min is not None:
-        chart = chart[chart["ts"] >= t_min]
-
+    chart["ts"] = pd.to_datetime(chart["window_end"], utc=True)
     fig.add_trace(go.Scatter(
         x=chart["ts"], y=chart["mean_vibration"],
-        mode="lines+markers", name="10-min mean",
+        mode="lines+markers", name="2-min mean",
         line=dict(color="#1f77b4", width=2),
         marker=dict(size=5),
     ))
 
+    fig.update_layout(xaxis=dict(range=[now - window, now + timedelta(minutes=2)]))
     return fig
 
 
@@ -362,7 +356,7 @@ st.subheader("Calculated Metrics")
 m1, m2, m3, m4 = st.columns(4)
 
 with m1:
-    st.markdown("**Mean Cook Temp** *(2-min sliding window)*")
+    st.markdown("**Mean Cook Temp** *(1-min sliding window)*")
     tdf = temp_window_metrics(m_buf)
     if not tdf.empty:
         latest_temp = tdf.iloc[-1]["mean_temp"]
@@ -402,10 +396,10 @@ with m4:
     vdf = vibration_window_metrics(m_buf)
     alert_status, current_vib = vibration_alert(vdf)
     if alert_status == "ALERT":
-        st.metric("10-min mean", f"{current_vib:.3f} g")
+        st.metric("2-min mean", f"{current_vib:.3f} g")
         st.error("Vibration above baseline × 1.5 — check mixer")
     elif alert_status == "OK" and current_vib is not None:
-        st.metric("10-min mean", f"{current_vib:.3f} g")
+        st.metric("2-min mean", f"{current_vib:.3f} g")
         st.success("Normal")
     else:
         st.caption("No data yet")

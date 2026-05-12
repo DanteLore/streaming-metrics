@@ -28,10 +28,10 @@ Ten sensors publish telemetry at ~1Hz. Spark computes four metrics from the stre
 
 | Metric | Type | Window |
 |---|---|---|
-| Mean cook temperature | Sliding average | 2 min, 30-sec slide |
+| Mean cook temperature | Sliding average | 1 min, 30-sec slide |
 | Sausages per hour | Running counter | 1-hour tumbling |
-| Food-safety compliance | Threshold violation log | 2-min tumbling |
-| Mixer vibration health | Relative trend alert | 10-min sliding vs baseline |
+| Food-safety compliance | Threshold violation log | 1-min tumbling |
+| Mixer vibration health | Relative trend alert | 2-min sliding vs baseline |
 
 ---
 

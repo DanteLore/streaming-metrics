@@ -148,10 +148,10 @@ def run() -> None:
 
     cook = telemetry.filter(col("device_id").isin("cook_temp_1", "cook_temp_2"))
 
-    # Metric 1 — sliding mean cook temperature (2-min window, 30-sec slide).
+    # Metric 1 — sliding mean cook temperature (1-min window, 30-sec slide).
     temp_stream = (
         cook
-        .groupBy(window("event_time", "2 minutes", "30 seconds"))
+        .groupBy(window("event_time", "1 minute", "30 seconds"))
         .agg(
             sum("value").alias("temp_sum"),
             count("value").alias("temp_count"),
@@ -166,18 +166,18 @@ def run() -> None:
         .agg(sum("value").alias("total_sausages"))
     )
 
-    # Metric 3 — cook temperature food-safety compliance (2-min tumbling windows).
+    # Metric 3 — cook temperature food-safety compliance (1-min tumbling windows).
     compliance_stream = (
         cook
-        .groupBy(window("event_time", "2 minutes"))
+        .groupBy(window("event_time", "1 minute"))
         .agg((sum("value") / count("value")).alias("mean_temp"))
     )
 
-    # Metric 4 — mixer vibration health (10-min sliding window).
+    # Metric 4 — mixer vibration health (2-min sliding window).
     vibration_stream = (
         telemetry
         .filter(col("device_id") == "mixer_vibration")
-        .groupBy(window("event_time", "10 minutes", "1 minute"))
+        .groupBy(window("event_time", "2 minutes", "30 seconds"))
         .agg(avg("value").alias("mean_vibration"))
     )
 
@@ -215,7 +215,7 @@ def run() -> None:
         .foreachBatch(publish_vibration)
         .outputMode("update")
         .option("checkpointLocation", checkpoint("vibration"))
-        .trigger(processingTime="30 seconds")
+        .trigger(processingTime=TRIGGER)
         .start()
     )
 
